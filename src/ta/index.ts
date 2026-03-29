@@ -131,11 +131,12 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
   try {
     logger.info(`Analyzing ${asset}...`);
 
-    const [c15m, c1h, c4h] = await Promise.all([
-      fetchOHLCV(asset, '15m', 60),
-      fetchOHLCV(asset, '1h',  60),
-      fetchOHLCV(asset, '4h',  60),
-    ]);
+    // Sequential with delay to avoid CryptoCompare rate limit
+    const c15m = await fetchOHLCV(asset, '15m', 60);
+    await new Promise(r => setTimeout(r, 1000));
+    const c1h  = await fetchOHLCV(asset, '1h',  60);
+    await new Promise(r => setTimeout(r, 1000));
+    const c4h  = await fetchOHLCV(asset, '4h',  60);
 
     const tf15m = calcTF(c15m);
     const tf1h  = calcTF(c1h);
@@ -201,6 +202,11 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
 }
 
 export async function analyzeAll(): Promise<TAResult[]> {
-  const results = await Promise.allSettled(ASSETS.map(analyzeAsset));
-  return results.map(r => r.status==='fulfilled' ? r.value : null).filter((r): r is TAResult => r!==null);
+  const results: TAResult[] = [];
+  for (const asset of ASSETS) {
+    const r = await analyzeAsset(asset).catch(() => null);
+    if (r) results.push(r);
+    await new Promise(res => setTimeout(res, 3000)); // 3s delay between assets
+  }
+  return results;
 }

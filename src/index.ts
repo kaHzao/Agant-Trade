@@ -1,7 +1,7 @@
 import { config, ASSETS } from './utils/config';
 import { logger } from './utils/logger';
 import { sendAlert } from './utils/telegram';
-import { analyzeAsset } from './ta/index';
+import { analyzeAsset, analyzeAll } from './ta/index';
 import { executeTrade, checkJupInstalled, getPositions, getMarketPrices } from './execution/jup';
 
 async function main() {
@@ -29,11 +29,7 @@ async function main() {
   }
 
   // ── Analyze all 3 assets ───────────────────────────────────────────────
-  const results = await Promise.allSettled(ASSETS.map(a => analyzeAsset(a)));
-
-  const signals = results
-    .map((r, i) => r.status === 'fulfilled' ? r.value : null)
-    .filter(Boolean);
+  const signals = await analyzeAll();
 
   let tradesOpened = 0;
 
