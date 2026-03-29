@@ -2,8 +2,8 @@ name: Perps Trading Agent
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # Tiap 15 menit, 24/7
-  workflow_dispatch:          # Manual trigger untuk test
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 jobs:
   trade:
@@ -26,11 +26,23 @@ jobs:
       - name: Install Jupiter CLI
         run: npm install -g @jup-ag/cli
 
-      - name: Import wallet key
+      - name: Check jup version
+        run: jup --version
+
+      - name: Setup wallet key
         env:
           JUP_PRIVATE_KEY: ${{ secrets.JUP_PRIVATE_KEY }}
         run: |
-          echo "$JUP_PRIVATE_KEY" | jup keys import --name default --stdin
+          # Create jup config directory
+          mkdir -p ~/.config/jup/keys
+          # Write key file directly (array bytes format)
+          echo "$JUP_PRIVATE_KEY" > ~/.config/jup/keys/default
+          # Set as active key
+          mkdir -p ~/.config/jup
+          echo '{"activeKey":"default"}' > ~/.config/jup/config.json
+
+      - name: Verify wallet
+        run: jup keys list
 
       - name: Run trading agent
         env:
