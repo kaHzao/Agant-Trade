@@ -1,0 +1,42 @@
+name: Perps Trading Agent
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # Tiap 15 menit, 24/7
+  workflow_dispatch:          # Manual trigger untuk test
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Jupiter CLI
+        run: npm install -g @jup-ag/cli
+
+      - name: Import wallet key
+        env:
+          JUP_PRIVATE_KEY: ${{ secrets.JUP_PRIVATE_KEY }}
+        run: |
+          echo "$JUP_PRIVATE_KEY" | jup keys import --name default --stdin
+
+      - name: Run trading agent
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COLLATERAL_USDC: ${{ vars.COLLATERAL_USDC }}
+          LEVERAGE: ${{ vars.LEVERAGE }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+        run: npm run trade
