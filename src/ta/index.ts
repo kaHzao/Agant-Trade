@@ -26,22 +26,48 @@ interface Candle {
   close: number; volume: number;
 }
 
-// ─── Binance public OHLCV (no API key needed) ────────────────────────────────
+// ─── CoinGecko IDs ───────────────────────────────────────────────────────────
 
-async function fetchOHLCV(asset: Asset, interval: string, limit = 60): Promise<Candle[]> {
-  const symbol = config.binance.symbols[asset];
-  const { data } = await axios.get(`${config.binance.baseUrl}/api/v3/klines`, {
-    params: { symbol, interval, limit },
-    timeout: 10000,
-  });
-  // Binance klines: [openTime, open, high, low, close, volume, ...]
-  return data.map((k: any[]) => ({
-    open:   parseFloat(k[1]),
-    high:   parseFloat(k[2]),
-    low:    parseFloat(k[3]),
-    close:  parseFloat(k[4]),
-    volume: parseFloat(k[5]),
+const COINGECKO_IDS: Record<Asset, string> = {
+  SOL: 'solana',
+  BTC: 'bitcoin',
+  ETH: 'ethereum',
+};
+
+// CoinGecko interval mapping → days needed
+const TF_CONFIG = {
+  '15m': { days: 1,   interval: 'minutely' },
+  '1h':  { days: 2,   interval: 'hourly'   },
+  '4h':  { days: 14,  interval: 'hourly'   },
+};
+
+// ─── Fetch OHLCV from CoinGecko (free, no key, no geo-block) ─────────────────
+
+async function fetchOHLCV(asset: Asset, tf: '15m' | '1h' | '4h', limit = 60): Promise<Candle[]> {
+  const id = COINGECKO_IDS[asset];
+  const { days } = TF_CONFIG[tf];
+
+  const { data } = await axios.get(
+    `https://api.coingecko.com/api/v3/coins/${id}/ohlc`,
+    {
+      params: { vs_currency: 'usd', days },
+      headers: { 'Accept': 'application/json' },
+      timeout: 15000,
+    }
+  );
+
+  // CoinGecko OHLC: [timestamp, open, high, low, close]
+  // No volume in free tier — set to 1 (volume check will be skipped)
+  const candles: Candle[] = data.map((k: number[]) => ({
+    open:   k[1],
+    high:   k[2],
+    low:    k[3],
+    close:  k[4],
+    volume: 1,
   }));
+
+  // Return last `limit` candles
+  return candles.slice(-limit);
 }
 
 // ─── TA helpers ──────────────────────────────────────────────────────────────
@@ -50,8 +76,9 @@ interface TFResult {
   emaFast: number; emaSlow: number;
   emaFastPrev: number; emaSlowPrev: number;
   rsi: number; currentPrice: number;
-  uptrend: boolean; bullishCross: boolean; bearishCross: boolean;
-  volumeOk: boolean; higherHighs: boolean;
+  uptrend: boolean;
+  bullishCross: boolean; bearishCross: boolean;
+  higherHighs: boolean; lowerLows: boolean;
 }
 
 function calcTF(candles: Candle[]): TFResult | null {
@@ -65,37 +92,59 @@ function calcTF(candles: Candle[]): TFResult | null {
   const ef = fa[fa.length - 1], efp = fa[fa.length - 2];
   const es = sa[sa.length - 1], esp = sa[sa.length - 2];
 
-  const avgVol = candles.slice(-11, -1).reduce((s, c) => s + c.volume, 0) / 10;
-  const volumeOk = candles[candles.length - 1].volume >= avgVol * config.ta.volumeMultiplier;
-
   const lb = config.ta.swingLookback;
+  const recentHighs  = candles.slice(-lb).map(c => c.high);
+  const priorHighs   = candles.slice(-lb * 2, -lb).map(c => c.high);
+  const recentLows   = candles.slice(-lb).map(c => c.low);
+  const priorLows    = candles.slice(-lb * 2, -lb).map(c => c.low);
+
   const higherHighs = candles.length >= lb * 2
-    ? Math.max(...candles.slice(-lb).map(c => c.high)) > Math.max(...candles.slice(-lb * 2, -lb).map(c => c.high)) &&
-      Math.min(...candles.slice(-lb).map(c => c.low))  > Math.min(...candles.slice(-lb * 2, -lb).map(c => c.low))
+    ? Math.max(...recentHighs) > Math.max(...priorHighs) &&
+      Math.min(...recentLows)  > Math.min(...priorLows)
+    : false;
+
+  const lowerLows = candles.length >= lb * 2
+    ? Math.max(...recentHighs) < Math.max(...priorHighs) &&
+      Math.min(...recentLows)  < Math.min(...priorLows)
     : false;
 
   return {
     emaFast: ef, emaSlow: es, emaFastPrev: efp, emaSlowPrev: esp,
-    rsi: ra[ra.length - 1], currentPrice: closes[closes.length - 1],
+    rsi: ra[ra.length - 1],
+    currentPrice: closes[closes.length - 1],
     uptrend: ef > es,
     bullishCross: efp <= esp && ef > es,
     bearishCross: efp >= esp && ef < es,
-    volumeOk, higherHighs,
+    higherHighs, lowerLows,
   };
 }
 
-function calcConfidence(tf15m: TFResult, tf1h: TFResult, tf4h: TFResult): number {
+// ─── Confidence score — balanced for LONG and SHORT ──────────────────────────
+
+function calcConfidence(tf15m: TFResult, tf1h: TFResult, tf4h: TFResult, signal: Signal): number {
   let s = 0;
-  if (tf4h.uptrend)     s += 20;
-  if (tf1h.uptrend)     s += 15;
-  if (tf15m.uptrend)    s += 10;
-  if (tf15m.rsi >= 45 && tf15m.rsi <= 60) s += 20;
-  else if (tf15m.rsi >= 40 && tf15m.rsi <= 65) s += 10;
-  if (tf15m.volumeOk)   s += 10;
-  if (tf1h.volumeOk)    s += 5;
-  if (tf1h.higherHighs) s += 10;
-  if (tf4h.higherHighs) s += 5;
-  if (tf15m.bullishCross) s += 5;
+
+  if (signal === 'LONG') {
+    if (tf4h.uptrend)      s += 20;
+    if (tf1h.uptrend)      s += 15;
+    if (tf15m.uptrend)     s += 10;
+    if (tf15m.rsi >= 45 && tf15m.rsi <= 60) s += 20;
+    else if (tf15m.rsi >= 40 && tf15m.rsi <= 65) s += 10;
+    if (tf1h.higherHighs)  s += 10;
+    if (tf4h.higherHighs)  s += 10;
+    if (tf15m.bullishCross) s += 15;
+  } else {
+    // SHORT scoring — mirror of LONG
+    if (!tf4h.uptrend)     s += 20;
+    if (!tf1h.uptrend)     s += 15;
+    if (!tf15m.uptrend)    s += 10;
+    if (tf15m.rsi >= 40 && tf15m.rsi <= 55) s += 20;
+    else if (tf15m.rsi >= 35 && tf15m.rsi <= 60) s += 10;
+    if (tf1h.lowerLows)    s += 10;
+    if (tf4h.lowerLows)    s += 10;
+    if (tf15m.bearishCross) s += 15;
+  }
+
   return Math.max(0, Math.min(100, s));
 }
 
@@ -112,11 +161,12 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
   try {
     logger.info(`Analyzing ${asset}...`);
 
-    const [c15m, c1h, c4h] = await Promise.all([
-      fetchOHLCV(asset, '15m', 60),
-      fetchOHLCV(asset, '1h', 60),
-      fetchOHLCV(asset, '4h', 60),
-    ]);
+    // CoinGecko free tier has rate limit — stagger requests
+    const c15m = await fetchOHLCV(asset, '15m', 60);
+    await new Promise(r => setTimeout(r, 1500));
+    const c1h  = await fetchOHLCV(asset, '1h', 60);
+    await new Promise(r => setTimeout(r, 1500));
+    const c4h  = await fetchOHLCV(asset, '4h', 60);
 
     const tf15m = calcTF(c15m);
     const tf1h  = calcTF(c1h);
@@ -127,43 +177,67 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       return null;
     }
 
-    const price    = tf15m.currentPrice;
-    const trend4h  = tf4h.uptrend ? 'BULLISH' : 'BEARISH' as const;
-    const trend1h  = tf1h.uptrend ? 'BULLISH' : 'BEARISH' as const;
-    const conf     = calcConfidence(tf15m, tf1h, tf4h);
+    const price   = tf15m.currentPrice;
+    const trend4h = tf4h.uptrend ? 'BULLISH' : 'BEARISH' as const;
+    const trend1h = tf1h.uptrend ? 'BULLISH' : 'BEARISH' as const;
 
-    // Dynamic SL/TP
-    const sl     = swingLow(c15m, config.ta.swingLookback) * 0.995;
-    const slDist = price - sl;
-    const minTP  = price + slDist * config.ta.minRR;
-    const tp     = Math.max(minTP, swingHigh(c1h) * 0.99);
-    const rr     = (tp - price) / slDist;
-    const slPct  = ((price - sl) / price) * 100;
-    const tpPct  = ((tp - price) / price) * 100;
-
-    // ── Signal ───────────────────────────────────────────────────────────
+    // ── Determine signal direction first ──────────────────────────────────
     let signal: Signal = 'HOLD';
     let reason = '';
 
-    const allBullish = tf4h.uptrend && tf1h.uptrend;
-    const entryOk = tf15m.bullishCross &&
-      tf15m.rsi >= config.ta.rsiBuyMin &&
-      tf15m.rsi <= config.ta.rsiBuyMax &&
-      tf15m.volumeOk;
-    const rrOk = rr >= config.ta.minRR;
+    const allBullish  = tf4h.uptrend && tf1h.uptrend;
+    const allBearish  = !tf4h.uptrend && !tf1h.uptrend;
+    const longEntry   = tf15m.bullishCross && tf15m.rsi >= config.ta.rsiBuyMin && tf15m.rsi <= config.ta.rsiBuyMax;
+    const shortEntry  = tf15m.bearishCross && tf15m.rsi >= 35 && tf15m.rsi <= 60;
+    const overbought  = tf15m.rsi >= config.ta.rsiSellMin;
+    const oversold    = tf15m.rsi <= 30;
 
-    if (allBullish && entryOk && rrOk && conf >= config.ta.minConfidence) {
+    if (allBullish && longEntry) {
       signal = 'LONG';
-      reason = `4h✓ 1h✓ 15m cross✓ | RSI ${tf15m.rsi.toFixed(1)} | R:R ${rr.toFixed(1)}x | ${conf}% conf`;
-    } else if (
-      (!tf4h.uptrend && !tf1h.uptrend) ||
-      tf4h.bearishCross ||
-      tf15m.rsi >= config.ta.rsiSellMin
-    ) {
+    } else if (allBearish && shortEntry) {
       signal = 'SHORT';
-      reason = tf15m.rsi >= config.ta.rsiSellMin
-        ? `RSI overbought ${tf15m.rsi.toFixed(1)}`
-        : '4h + 1h bearish';
+    } else if (overbought) {
+      signal = 'SHORT';
+    } else if (oversold && tf4h.uptrend) {
+      signal = 'LONG';
+    }
+
+    if (signal === 'HOLD') {
+      logger.info(`${asset} → HOLD | RSI:${tf15m.rsi.toFixed(1)} | trend4h:${trend4h} | trend1h:${trend1h}`);
+      return {
+        asset, signal: 'HOLD', reason: 'No clear signal',
+        confidence: 0, currentPrice: price, rsi15m: tf15m.rsi,
+        trend4h, trend1h,
+        suggestedSL: 0, suggestedTP: 0, slPct: 0, tpPct: 0, rrRatio: 0,
+      };
+    }
+
+    // ── Confidence with signal-aware scoring ──────────────────────────────
+    const conf = calcConfidence(tf15m, tf1h, tf4h, signal);
+
+    // ── Dynamic SL/TP ─────────────────────────────────────────────────────
+    let sl: number, tp: number;
+
+    if (signal === 'LONG') {
+      sl = swingLow(c15m, config.ta.swingLookback) * 0.995;
+      const slDist = price - sl;
+      tp = Math.max(price + slDist * config.ta.minRR, swingHigh(c1h) * 0.99);
+    } else {
+      sl = swingHigh(c15m, config.ta.swingLookback) * 1.005;
+      const slDist = sl - price;
+      tp = Math.min(price - slDist * config.ta.minRR, swingLow(c1h) * 1.01);
+    }
+
+    const slDist = signal === 'LONG' ? price - sl : sl - price;
+    const tpDist = signal === 'LONG' ? tp - price : price - tp;
+    const rr     = tpDist / slDist;
+    const slPct  = (slDist / price) * 100;
+    const tpPct  = (tpDist / price) * 100;
+
+    if (signal === 'LONG') {
+      reason = `4h✓ 1h✓ 15m cross✓ | RSI ${tf15m.rsi.toFixed(1)} | R:R ${rr.toFixed(1)}x | ${conf}%`;
+    } else {
+      reason = `4h✓ 1h✓ 15m bearish | RSI ${tf15m.rsi.toFixed(1)} | R:R ${rr.toFixed(1)}x | ${conf}%`;
     }
 
     logger.info(`${asset} → ${signal} | conf:${conf}% | RSI:${tf15m.rsi.toFixed(1)} | trend4h:${trend4h} | trend1h:${trend1h} | R:R:${rr.toFixed(2)}`);
@@ -182,11 +256,13 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
   }
 }
 
-// ─── Run all 3 assets ─────────────────────────────────────────────────────────
-
 export async function analyzeAll(): Promise<TAResult[]> {
-  const results = await Promise.allSettled(ASSETS.map(analyzeAsset));
-  return results
-    .map(r => r.status === 'fulfilled' ? r.value : null)
-    .filter((r): r is TAResult => r !== null);
+  const results: TAResult[] = [];
+  // Sequential to respect CoinGecko rate limit
+  for (const asset of ASSETS) {
+    const r = await analyzeAsset(asset);
+    if (r) results.push(r);
+    await new Promise(res => setTimeout(res, 2000));
+  }
+  return results;
 }
