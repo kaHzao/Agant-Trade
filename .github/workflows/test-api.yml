@@ -1,0 +1,51 @@
+name: Test API Access
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test which APIs work from GitHub Actions
+        run: |
+          echo "=== Testing APIs ==="
+          
+          echo -n "CryptoCompare: "
+          curl -s -o /dev/null -w "%{http_code}" "https://min-api.cryptocompare.com/data/histominute?fsym=BTC&tsym=USD&limit=3&aggregate=15"
+          echo ""
+          
+          echo -n "Binance spot: "
+          curl -s -o /dev/null -w "%{http_code}" "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=3"
+          echo ""
+          
+          echo -n "Gate.io: "
+          curl -s -o /dev/null -w "%{http_code}" "https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=BTC_USDT&interval=15m&limit=3"
+          echo ""
+          
+          echo -n "Kraken: "
+          curl -s -o /dev/null -w "%{http_code}" "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=15"
+          echo ""
+          
+          echo -n "Huobi: "
+          curl -s -o /dev/null -w "%{http_code}" "https://api.huobi.pro/market/history/kline?symbol=btcusdt&period=15min&size=3"
+          echo ""
+          
+          echo -n "Kucoin: "
+          curl -s -o /dev/null -w "%{http_code}" "https://api.kucoin.com/api/v1/market/candles?symbol=BTC-USDT&type=15min"
+          echo ""
+
+          echo -n "Bybit: "
+          curl -s -o /dev/null -w "%{http_code}" "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=15&limit=3"
+          echo ""
+
+          echo -n "OKX: "
+          curl -s -o /dev/null -w "%{http_code}" "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=15m&limit=3"
+          echo ""
+
+          echo -n "Bitget: "
+          curl -s -o /dev/null -w "%{http_code}" "https://api.bitget.com/api/v2/spot/market/candles?symbol=BTCUSDT&granularity=15min&limit=3"
+          echo ""
+
+          echo "=== Sample data from working APIs ==="
+          curl -s "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=15" | head -c 200
