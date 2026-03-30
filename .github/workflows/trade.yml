@@ -23,43 +23,23 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Install Jupiter CLI
-        run: npm install -g @jup-ag/cli
-
-      - name: Check jup version
-        run: jup --version
+      - name: Install Jupiter CLI and bs58
+        run: |
+          npm install -g @jup-ag/cli
+          npm install -g bs58
 
       - name: Setup wallet key
         env:
           JUP_PRIVATE_KEY: ${{ secrets.JUP_PRIVATE_KEY }}
         run: |
-          mkdir -p ~/.config/jup/keys
-
-          # Convert array bytes format to Uint8Array and save as JSON
-          node -e "
-            const keyStr = process.env.JUP_PRIVATE_KEY.trim();
-            // Handle both formats: array [1,2,3] or base58 string
-            let keyData;
-            if (keyStr.startsWith('[')) {
-              // Array bytes format
-              keyData = JSON.parse(keyStr);
-            } else {
-              // Already JSON or other format
-              keyData = JSON.parse(keyStr);
-            }
-            // Save as JSON array (what jup expects)
-            require('fs').writeFileSync(
-              process.env.HOME + '/.config/jup/keys/default',
-              JSON.stringify(keyData)
-            );
-            console.log('Key saved, length:', keyData.length);
-          "
-
-          # Set active key config
-          echo '{"activeKey":"default"}' > ~/.config/jup/config.json
-
-      - name: Verify wallet
-        run: jup keys list
+          # Convert array bytes → base58 → pipe to jup keys add
+          BASE58_KEY=$(node -e "
+            const bs58 = require('bs58');
+            const keyData = JSON.parse(process.env.JUP_PRIVATE_KEY.trim());
+            process.stdout.write(bs58.encode(Buffer.from(keyData)));
+          ")
+          echo "$BASE58_KEY" | jup keys add default --stdin
+          jup keys list
 
       - name: Run trading agent
         env:
