@@ -33,12 +33,29 @@ jobs:
         env:
           JUP_PRIVATE_KEY: ${{ secrets.JUP_PRIVATE_KEY }}
         run: |
-          # Create jup config directory
           mkdir -p ~/.config/jup/keys
-          # Write key file directly (array bytes format)
-          echo "$JUP_PRIVATE_KEY" > ~/.config/jup/keys/default
-          # Set as active key
-          mkdir -p ~/.config/jup
+
+          # Convert array bytes format to Uint8Array and save as JSON
+          node -e "
+            const keyStr = process.env.JUP_PRIVATE_KEY.trim();
+            // Handle both formats: array [1,2,3] or base58 string
+            let keyData;
+            if (keyStr.startsWith('[')) {
+              // Array bytes format
+              keyData = JSON.parse(keyStr);
+            } else {
+              // Already JSON or other format
+              keyData = JSON.parse(keyStr);
+            }
+            // Save as JSON array (what jup expects)
+            require('fs').writeFileSync(
+              process.env.HOME + '/.config/jup/keys/default',
+              JSON.stringify(keyData)
+            );
+            console.log('Key saved, length:', keyData.length);
+          "
+
+          # Set active key config
           echo '{"activeKey":"default"}' > ~/.config/jup/config.json
 
       - name: Verify wallet
