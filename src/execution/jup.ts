@@ -43,7 +43,7 @@ export interface TradeResult {
 }
 
 function jupCmd(args: string): string {
-  const cmd = `${JUP} ${args} --format json`;
+  const cmd = `${JUP} ${args} -f json`;
   logger.debug(`Running: ${cmd}`);
   try {
     return execSync(cmd, { encoding: 'utf-8', timeout: 30_000 });
