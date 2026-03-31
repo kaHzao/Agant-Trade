@@ -30,18 +30,23 @@ jobs:
         env:
           JUP_PRIVATE_KEY: ${{ secrets.JUP_PRIVATE_KEY }}
         run: |
-          # Write key as JSON file then import via --file flag
+          # Find where jup stores keys on Linux
           mkdir -p ~/.config/jup/keys
+
+          # Write key as default.json (correct filename)
           node -e "
             const key = process.env.JUP_PRIVATE_KEY.trim();
-            const fs = require('fs');
-            const os = require('os');
-            // Write raw key array as JSON file
-            fs.writeFileSync('/tmp/keypair.json', key);
-            console.log('Key file written');
+            require('fs').writeFileSync(process.env.HOME + '/.config/jup/keys/default.json', key);
+            console.log('Key written to default.json');
           "
-          jup keys add default --file /tmp/keypair.json --overwrite
-          rm /tmp/keypair.json
+
+          # Write settings.json to set active key
+          node -e "
+            const settings = { activeKey: 'default' };
+            require('fs').writeFileSync(process.env.HOME + '/.config/jup/settings.json', JSON.stringify(settings));
+            console.log('Settings written');
+          "
+
           jup keys list
 
       - name: Run trading agent
