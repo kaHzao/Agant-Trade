@@ -2,7 +2,7 @@ name: Perps Trading Agent
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -30,8 +30,18 @@ jobs:
         env:
           JUP_PRIVATE_KEY: ${{ secrets.JUP_PRIVATE_KEY }}
         run: |
-          # Import directly using --private-key with JSON byte array format
-          jup keys add default --private-key "$JUP_PRIVATE_KEY" --overwrite
+          # Write key as JSON file then import via --file flag
+          mkdir -p ~/.config/jup/keys
+          node -e "
+            const key = process.env.JUP_PRIVATE_KEY.trim();
+            const fs = require('fs');
+            const os = require('os');
+            // Write raw key array as JSON file
+            fs.writeFileSync('/tmp/keypair.json', key);
+            console.log('Key file written');
+          "
+          jup keys add default --file /tmp/keypair.json --overwrite
+          rm /tmp/keypair.json
           jup keys list
 
       - name: Run trading agent
