@@ -1,34 +1,38 @@
 import { config, ASSETS } from './utils/config';
 import { logger } from './utils/logger';
 import { sendAlert } from './utils/telegram';
-import { analyzeAsset, analyzeAll } from './ta/index';
+import { analyzeAll } from './ta/index';
 import { executeTrade, checkJupInstalled, getPositions, getMarketPrices } from './execution/jup';
+import { canTrade, recordTradeOpened, recordSL, getDailyStatus } from './utils/riskGuard';
 
 async function main() {
   logger.info('═══ Jupiter Perps Agent starting ═══');
   logger.info(`Mode: ${config.trading.dryRun ? '⚠️  DRY RUN' : '🔴 LIVE'}`);
-  logger.info(`Pairs: ${ASSETS.join(', ')} | Collateral: $${config.trading.collateralUsdc} USDC | ${config.trading.leverage}x`);
+  logger.info(`Pairs: ${ASSETS.join(', ')} | $${config.trading.collateralUsdc} | ${config.trading.leverage}x`);
 
-  // ── Check jup CLI installed ────────────────────────────────────────────
+  // ── Check jup CLI ──────────────────────────────────────────────────────────
   if (!checkJupInstalled()) {
-    const msg = '❌ `jup` CLI not installed. Run: `npm i -g @jup-ag/cli`';
+    const msg = '❌ `jup` CLI not installed';
     logger.error(msg);
     await sendAlert(msg);
     process.exit(1);
   }
 
-  // ── Check existing open positions ──────────────────────────────────────
+  // ── Log daily risk status ──────────────────────────────────────────────────
+  logger.info(getDailyStatus());
+
+  // ── Check open positions (detect SL hits from previous cycle) ─────────────
   const openPositions = getPositions();
   const openAssets = new Set(openPositions.map((p: any) => p.asset as string));
-  logger.info(`Open positions: ${openPositions.length}`, openAssets.size ? { assets: [...openAssets] } : {});
+  logger.info(`Open positions: ${openPositions.length}`);
 
-  // ── Get current market prices for context ──────────────────────────────
+  // ── Market prices ──────────────────────────────────────────────────────────
   const prices = getMarketPrices();
   if (Object.keys(prices).length) {
     logger.info('Market prices', prices);
   }
 
-  // ── Analyze all 3 assets ───────────────────────────────────────────────
+  // ── Run TA on all assets ───────────────────────────────────────────────────
   const signals = await analyzeAll();
 
   let tradesOpened = 0;
@@ -36,61 +40,64 @@ async function main() {
   for (const ta of signals) {
     if (!ta) continue;
 
-    // Skip if already in a position for this asset
+    // Skip if already in position
     if (openAssets.has(ta.asset)) {
-      logger.info(`${ta.asset}: skipping — already in position`);
+      logger.info(`${ta.asset}: already in position, skipping`);
       continue;
     }
 
     if (ta.signal === 'HOLD') {
-      logger.info(`${ta.asset}: HOLD (${ta.confidence}% confidence)`);
+      logger.info(`${ta.asset}: HOLD | ${ta.regime} | conf:${ta.confidence}% | RSI:${ta.rsi15m.toFixed(1)}`);
       continue;
     }
 
     if (ta.confidence < config.ta.minConfidence) {
-      logger.info(`${ta.asset}: ${ta.signal} signal but confidence too low (${ta.confidence}% < ${config.ta.minConfidence}%)`);
+      logger.info(`${ta.asset}: ${ta.signal} confidence too low (${ta.confidence}% < ${config.ta.minConfidence}%)`);
       continue;
     }
 
-    // ── Execute trade ──────────────────────────────────────────────────
+    // ── Risk Guard check ────────────────────────────────────────────────────
+    const guard = canTrade(ta.asset);
+    if (!guard.allowed) {
+      logger.warn(`${ta.asset}: BLOCKED by risk guard — ${guard.reason}`);
+      await sendAlert(`⛔ *${ta.asset} blocked*\n${guard.reason}`);
+      continue;
+    }
+
+    // ── Execute trade ────────────────────────────────────────────────────────
+    logger.info(`🎯 ${ta.signal} ${ta.asset} | ${ta.reason}`);
     const result = await executeTrade(ta);
 
     if (result.success) {
       tradesOpened++;
+      recordTradeOpened(ta.asset);
+
       const emoji = ta.signal === 'LONG' ? '🟢' : '🔴';
       await sendAlert(
-        `${emoji} *${ta.signal} ${ta.asset}* ${result.dryRun ? '_(DRY RUN)_' : ''}\n` +
+        `${emoji} *${ta.signal} ${ta.asset}*${result.dryRun ? ' _(DRY RUN)_' : ''}\n` +
         `Price: \`$${ta.currentPrice.toLocaleString()}\`\n` +
-        `Collateral: \`$${result.collateralUsdc} USDC × ${result.leverage}x\`\n` +
+        `Collateral: \`$${result.collateralUsdc} × ${result.leverage}x\`\n` +
         `SL: \`$${result.slPrice.toLocaleString()}\` (-${ta.slPct.toFixed(1)}%)\n` +
         `TP: \`$${result.tpPrice.toLocaleString()}\` (+${ta.tpPct.toFixed(1)}%)\n` +
         `R:R: \`${result.rrRatio.toFixed(1)}x\`\n` +
-        `Confidence: \`${ta.confidence}%\`\n` +
-        `Signal: ${ta.reason}` +
-        (result.signature ? `\nTx: \`${result.signature.slice(0, 16)}...\`` : '')
+        `Regime: ${ta.regime} | ADX: ${ta.adx.toFixed(0)} | Conf: ${ta.confidence}%\n` +
+        `Signal: ${ta.reason}`
       );
-      logger.trade(`${ta.asset} ${ta.signal} opened`, result);
     } else {
-      await sendAlert(
-        `⚠️ *TRADE FAILED: ${ta.asset}*\n` +
-        `Error: ${result.error}`
-      );
       logger.error(`Trade failed: ${ta.asset}`, result.error);
+      await sendAlert(`⚠️ *Trade failed: ${ta.asset}*\n${result.error}`);
     }
   }
 
-  // ── Summary ────────────────────────────────────────────────────────────
   if (tradesOpened === 0) {
-    logger.info('No trades opened this cycle — conditions not met');
-  } else {
-    logger.info(`Cycle complete: ${tradesOpened} trade(s) opened`);
+    logger.info('No trades opened this cycle');
   }
 
-  logger.info('═══ Agent cycle complete ═══');
+  logger.info('═══ Cycle complete ═══\n');
 }
 
 main().catch(async err => {
   logger.error('Fatal error', err);
-  await sendAlert(`🚨 *Agent fatal error*\n\`${err.message}\``);
+  await sendAlert(`🚨 *Agent error*\n\`${err.message}\``);
   process.exit(1);
 });

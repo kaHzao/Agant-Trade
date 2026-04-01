@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { EMA, RSI, BollingerBands, ATR } from 'technicalindicators';
+import { EMA, RSI, BollingerBands, ATR, ADX } from 'technicalindicators';
 import { config, type Asset, ASSETS } from '../utils/config';
 import { logger } from '../utils/logger';
 
@@ -16,6 +16,7 @@ export interface TAResult {
   trend4h: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   trend1h: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   regime: MarketRegime;
+  adx: number;
   suggestedSL: number;
   suggestedTP: number;
   slPct: number;
@@ -30,7 +31,7 @@ interface Candle {
 
 // ─── CryptoCompare OHLCV ─────────────────────────────────────────────────────
 
-async function fetchOHLCV(asset: Asset, tf: '15m' | '1h' | '4h', limit = 60): Promise<Candle[]> {
+async function fetchOHLCV(asset: Asset, tf: '15m' | '1h' | '4h', limit = 100): Promise<Candle[]> {
   const isMinute = tf === '15m';
   const endpoint = isMinute ? 'histominute' : 'histohour';
   const aggregate = tf === '15m' ? 15 : tf === '1h' ? 1 : 4;
@@ -46,241 +47,289 @@ async function fetchOHLCV(asset: Asset, tf: '15m' | '1h' | '4h', limit = 60): Pr
 
   if (data.Response === 'Error') throw new Error(data.Message);
   return (data.Data || []).map((k: any) => ({
-    open: k.open, high: k.high, low: k.low, close: k.close, volume: k.volumefrom,
+    open: k.open, high: k.high, low: k.low,
+    close: k.close, volume: k.volumefrom,
   }));
 }
 
-// ─── Market Regime Detection ──────────────────────────────────────────────────
-// ATR-based: low ATR relative to price = sideways, high ATR = trending
+// ─── Market Structure ─────────────────────────────────────────────────────────
 
-function detectRegime(candles: Candle[]): MarketRegime {
-  if (candles.length < 20) return 'TRENDING';
+function marketStructure(candles: Candle[]): { hh: boolean; ll: boolean } {
+  if (candles.length < 10) return { hh: false, ll: false };
+  const recent = candles.slice(-5);
+  const prior  = candles.slice(-10, -5);
+  const hh = Math.max(...recent.map(c => c.high)) > Math.max(...prior.map(c => c.high));
+  const ll = Math.min(...recent.map(c => c.low))  < Math.min(...prior.map(c => c.low));
+  return { hh, ll };
+}
 
+// ─── Regime Detection: ADX + ATR ─────────────────────────────────────────────
+
+function detectRegime(candles: Candle[]): { regime: MarketRegime; adx: number } {
   const highs  = candles.map(c => c.high);
   const lows   = candles.map(c => c.low);
   const closes = candles.map(c => c.close);
 
+  const adxArr = ADX.calculate({ period: 14, high: highs, low: lows, close: closes });
   const atrArr = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
-  if (!atrArr.length) return 'TRENDING';
 
-  const atr          = atrArr[atrArr.length - 1];
-  const currentPrice = closes[closes.length - 1];
-  const atrPct       = (atr / currentPrice) * 100;
+  const adxVal = adxArr.length ? (adxArr[adxArr.length - 1].adx || 10) : 10;
+  const atrVal = atrArr.length ? atrArr[atrArr.length - 1] : closes[closes.length - 1] * 0.02;
+  const atrPct = (atrVal / closes[closes.length - 1]) * 100;
 
-  // ATR < 1.5% of price = low volatility = SIDEWAYS
-  // ATR >= 1.5% = enough movement = TRENDING
-  return atrPct < 1.5 ? 'SIDEWAYS' : 'TRENDING';
+  const regime: MarketRegime = (adxVal > 20 && atrPct > 1) ? 'TRENDING' : 'SIDEWAYS';
+  return { regime, adx: adxVal };
 }
 
-// ─── Bollinger Bands signal (for SIDEWAYS) ────────────────────────────────────
+// ─── Trend Signal: EMA 20/50 + RSI + Market Structure ────────────────────────
 
-interface BBSignal {
+interface TrendResult {
   signal: Signal;
   reason: string;
-  upper: number;
-  lower: number;
-  middle: number;
-  bandwidth: number;  // (upper-lower)/middle = squeeze indicator
+  rsi: number;
+  emaFast: number;
+  emaSlow: number;
+  uptrend: boolean;
+  volumeOk: boolean;
 }
 
-function analyzeBB(candles: Candle[], rsi: number): BBSignal {
+function trendSignal(candles: Candle[], rsiBuyMin: number, rsiBuyMax: number, rsiShortMin: number, rsiShortMax: number): TrendResult {
   const closes = candles.map(c => c.close);
-  const price  = closes[closes.length - 1];
+  const emaFastArr = EMA.calculate({ period: 20, values: closes });
+  const emaSlowArr = EMA.calculate({ period: 50, values: closes });
+  const rsiArr     = RSI.calculate({ period: 14, values: closes });
 
-  const bbArr = BollingerBands.calculate({
-    period: 20, stdDev: 2, values: closes,
-  });
+  if (!emaFastArr.length || !emaSlowArr.length || !rsiArr.length) {
+    return { signal: 'HOLD', reason: 'Insufficient data', rsi: 50, emaFast: 0, emaSlow: 0, uptrend: false, volumeOk: false };
+  }
 
-  if (!bbArr.length) return { signal: 'HOLD', reason: 'Insufficient BB data', upper: 0, lower: 0, middle: 0, bandwidth: 0 };
-
-  const bb        = bbArr[bbArr.length - 1];
-  const bandwidth = ((bb.upper - bb.lower) / bb.middle) * 100;
+  const ef  = emaFastArr[emaFastArr.length - 1];
+  const es  = emaSlowArr[emaSlowArr.length - 1];
+  const rsi = rsiArr[rsiArr.length - 1];
+  const avgVol   = candles.slice(-11, -1).reduce((s, c) => s + c.volume, 0) / 10;
+  const volumeOk = candles[candles.length - 1].volume >= avgVol * config.ta.volumeMultiplier;
+  const uptrend  = ef > es;
+  const { hh, ll } = marketStructure(candles);
 
   let signal: Signal = 'HOLD';
   let reason = '';
 
-  // Price at lower band + RSI not oversold → LONG (mean reversion)
-  if (price <= bb.lower * 1.002 && rsi >= 30 && rsi <= 50) {
+  if (uptrend && hh && rsi >= rsiBuyMin && rsi <= rsiBuyMax) {
     signal = 'LONG';
-    reason = `BB lower band touch | RSI: ${rsi.toFixed(1)} | BW: ${bandwidth.toFixed(1)}%`;
-  }
-  // Price at upper band + RSI not overbought → SHORT (mean reversion)
-  else if (price >= bb.upper * 0.998 && rsi >= 50 && rsi <= 70) {
+    reason = `EMA20>50 ✓ | HH ✓ | RSI ${rsi.toFixed(1)}`;
+  } else if (!uptrend && ll && rsi >= rsiShortMin && rsi <= rsiShortMax) {
     signal = 'SHORT';
-    reason = `BB upper band touch | RSI: ${rsi.toFixed(1)} | BW: ${bandwidth.toFixed(1)}%`;
+    reason = `EMA20<50 ✓ | LL ✓ | RSI ${rsi.toFixed(1)}`;
   }
 
-  return { signal, reason, upper: bb.upper, lower: bb.lower, middle: bb.middle, bandwidth };
+  return { signal, reason, rsi, emaFast: ef, emaSlow: es, uptrend, volumeOk };
 }
 
-// ─── EMA + RSI signal (for TRENDING) ─────────────────────────────────────────
+// ─── BB Signal (SIDEWAYS) with STRICT macro trend filter ─────────────────────
+// FIX: Only SHORT if 4h is also bearish (avoid shorting in bullish macro)
+// FIX: Only LONG if 4h is also bullish (avoid longing in bearish macro)
 
-interface TFResult {
-  emaFast: number; emaSlow: number;
-  emaFastPrev: number; emaSlowPrev: number;
-  rsi: number; currentPrice: number;
-  uptrend: boolean;
-  bullishCross: boolean; bearishCross: boolean;
-  volumeOk: boolean;
-  higherHighs: boolean; lowerLows: boolean;
+interface BBResult {
+  signal: Signal;
+  reason: string;
+  bandwidth: number;
 }
 
-function calcTF(candles: Candle[]): TFResult | null {
-  if (candles.length < 25) return null;
-  const closes = candles.map(c => c.close);
-  const fa = EMA.calculate({ period: config.ta.emaFast, values: closes });
-  const sa = EMA.calculate({ period: config.ta.emaSlow, values: closes });
-  const ra = RSI.calculate({ period: config.ta.rsiPeriod, values: closes });
-  if (fa.length < 2 || sa.length < 2 || !ra.length) return null;
+function bbSignal(
+  candles15m: Candle[],
+  candles1h: Candle[],
+  candles4h: Candle[],
+  rsi: number
+): BBResult {
+  const closes = candles15m.map(c => c.close);
+  const price  = closes[closes.length - 1];
 
-  const ef = fa[fa.length-1], efp = fa[fa.length-2];
-  const es = sa[sa.length-1], esp = sa[sa.length-2];
-  const avgVol = candles.slice(-11,-1).reduce((s,c) => s+c.volume, 0) / 10;
-  const lb = config.ta.swingLookback;
-  const rH = candles.slice(-lb).map(c=>c.high),   pH = candles.slice(-lb*2,-lb).map(c=>c.high);
-  const rL = candles.slice(-lb).map(c=>c.low),    pL = candles.slice(-lb*2,-lb).map(c=>c.low);
+  const bbArr = BollingerBands.calculate({ period: 20, stdDev: 2, values: closes });
+  if (!bbArr.length) return { signal: 'HOLD', reason: 'No BB data', bandwidth: 0 };
 
-  return {
-    emaFast:ef, emaSlow:es, emaFastPrev:efp, emaSlowPrev:esp,
-    rsi: ra[ra.length-1], currentPrice: closes[closes.length-1],
-    uptrend: ef > es,
-    bullishCross: efp<=esp && ef>es,
-    bearishCross: efp>=esp && ef<es,
-    volumeOk: candles[candles.length-1].volume >= avgVol * config.ta.volumeMultiplier,
-    higherHighs: candles.length>=lb*2 ? Math.max(...rH)>Math.max(...pH) && Math.min(...rL)>Math.min(...pL) : false,
-    lowerLows:   candles.length>=lb*2 ? Math.max(...rH)<Math.max(...pH) && Math.min(...rL)<Math.min(...pL) : false,
-  };
+  const bb        = bbArr[bbArr.length - 1];
+  const bandwidth = ((bb.upper - bb.lower) / bb.middle) * 100;
+
+  // 1h trend
+  const closes1h   = candles1h.map(c => c.close);
+  const ema1hFast  = EMA.calculate({ period: 20, values: closes1h });
+  const ema1hSlow  = EMA.calculate({ period: 50, values: closes1h });
+  const trend1hUp  = ema1hFast.length && ema1hSlow.length
+    ? ema1hFast[ema1hFast.length - 1] > ema1hSlow[ema1hSlow.length - 1]
+    : true;
+
+  // 4h trend — STRICT MACRO FILTER (NEW)
+  const closes4h   = candles4h.map(c => c.close);
+  const ema4hFast  = EMA.calculate({ period: 20, values: closes4h });
+  const ema4hSlow  = EMA.calculate({ period: 50, values: closes4h });
+  const trend4hUp  = ema4hFast.length && ema4hSlow.length
+    ? ema4hFast[ema4hFast.length - 1] > ema4hSlow[ema4hSlow.length - 1]
+    : true;
+
+  let signal: Signal = 'HOLD';
+  let reason = '';
+
+  // LONG: price below middle + RSI 35-50
+  // + 1h NOT strong downtrend
+  // + 4h must be bullish or neutral (NEW — avoid longing in 4h downtrend)
+  if (price < bb.middle && rsi > 35 && rsi < 50 && !(!trend1hUp && !trend4hUp)) {
+    signal = 'LONG';
+    reason = `BB below mid | RSI ${rsi.toFixed(1)} | 4h OK`;
+  }
+  // SHORT: price above middle + RSI 50-65
+  // + 1h NOT strong uptrend
+  // + 4h must be bearish (NEW — ONLY short if macro bearish too)
+  else if (price > bb.middle && rsi < 65 && rsi > 50 && !trend1hUp && !trend4hUp) {
+    signal = 'SHORT';
+    reason = `BB above mid | RSI ${rsi.toFixed(1)} | 4h bearish confirmed`;
+  }
+
+  return { signal, reason, bandwidth };
 }
 
-// ─── ATR-based dynamic SL/TP ─────────────────────────────────────────────────
+// ─── ATR SL/TP ────────────────────────────────────────────────────────────────
 
-function calcATRSlTp(candles: Candle[], price: number, signal: Signal): { sl: number; tp: number } {
+function calcATRSlTp(candles: Candle[], price: number, signal: Signal) {
   const highs  = candles.map(c => c.high);
   const lows   = candles.map(c => c.low);
   const closes = candles.map(c => c.close);
-
   const atrArr = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
   const atr    = atrArr.length ? atrArr[atrArr.length - 1] : price * 0.02;
 
   if (signal === 'LONG') {
-    const sl = price - atr * 1.5;
-    const tp = price + atr * 1.5 * config.ta.minRR;
-    return { sl, tp };
+    return { sl: price - atr * 1.5, tp: price + atr * 1.5 * config.ta.minRR };
   } else {
-    const sl = price + atr * 1.5;
-    const tp = price - atr * 1.5 * config.ta.minRR;
-    return { sl, tp };
+    return { sl: price + atr * 1.5, tp: price - atr * 1.5 * config.ta.minRR };
   }
 }
 
-// ─── Confidence scoring ───────────────────────────────────────────────────────
+// ─── Confidence ───────────────────────────────────────────────────────────────
 
-function calcConfidence(tf15m: TFResult, tf1h: TFResult, tf4h: TFResult, signal: Signal, regime: MarketRegime): number {
+function calcConfidence(
+  trend: TrendResult,
+  tf4hUp: boolean,
+  regime: MarketRegime,
+  adx: number,
+  signal: Signal
+): number {
   let s = 0;
   if (signal === 'LONG') {
-    if (tf4h.uptrend)  s+=20; if (tf1h.uptrend)  s+=15; if (tf15m.uptrend) s+=10;
-    if (tf15m.rsi>=config.ta.rsiBuyMin && tf15m.rsi<=config.ta.rsiBuyMax) s+=20;
-    else if (tf15m.rsi>=40 && tf15m.rsi<=65) s+=10;
-    if (tf15m.volumeOk) s+=10; if (tf1h.higherHighs) s+=10; if (tf4h.higherHighs) s+=5;
-    // bullishCross removed - not reliable with 40min interval
+    if (tf4hUp)          s += 20;
+    if (trend.uptrend)   s += 15;
+    if (adx > 25)        s += 15; else if (adx > 20) s += 8;
+    const rsi = trend.rsi;
+    if (rsi >= 45 && rsi <= 60) s += 20; else if (rsi >= 40 && rsi <= 65) s += 10;
+    if (trend.volumeOk)  s += 15;
+    if (regime === 'TRENDING') s += 15;
   } else {
-    if (!tf4h.uptrend) s+=20; if (!tf1h.uptrend) s+=15; if (!tf15m.uptrend) s+=10;
-    if (tf15m.rsi>=config.ta.rsiShortMin && tf15m.rsi<=config.ta.rsiShortMax) s+=20;
-    else if (tf15m.rsi>=35 && tf15m.rsi<=65) s+=10;
-    if (tf15m.volumeOk) s+=10; if (tf1h.lowerLows) s+=10; if (tf4h.lowerLows) s+=5;
-    // bearishCross removed - not reliable with 40min interval
+    if (!tf4hUp)         s += 20;
+    if (!trend.uptrend)  s += 15;
+    if (adx > 25)        s += 15; else if (adx > 20) s += 8;
+    const rsi = trend.rsi;
+    if (rsi >= 40 && rsi <= 55) s += 20; else if (rsi >= 35 && rsi <= 60) s += 10;
+    if (trend.volumeOk)  s += 15;
+    if (regime === 'TRENDING') s += 15;
   }
-  // Bonus: strategy matches regime
-  if (regime === 'TRENDING') s += 5;
   return Math.max(0, Math.min(100, s));
 }
 
-// ─── Main analysis ────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
   try {
     logger.info(`Analyzing ${asset}...`);
 
-    const c15m = await fetchOHLCV(asset, '15m', 60);
+    const c15m = await fetchOHLCV(asset, '15m', 100);
     await new Promise(r => setTimeout(r, 1000));
-    const c1h  = await fetchOHLCV(asset, '1h',  60);
+    const c1h  = await fetchOHLCV(asset, '1h',  100);
     await new Promise(r => setTimeout(r, 1000));
-    const c4h  = await fetchOHLCV(asset, '4h',  60);
+    const c4h  = await fetchOHLCV(asset, '4h',  100);
 
-    const tf15m = calcTF(c15m);
-    const tf1h  = calcTF(c1h);
-    const tf4h  = calcTF(c4h);
-    if (!tf15m||!tf1h||!tf4h) { logger.warn(`${asset}: insufficient data`); return null; }
+    if (c15m.length < 60 || c1h.length < 60 || c4h.length < 25) {
+      logger.warn(`${asset}: insufficient candles`);
+      return null;
+    }
 
-    const price   = tf15m.currentPrice;
-    const trend4h = tf4h.uptrend ? 'BULLISH' : 'BEARISH' as const;
-    const trend1h = tf1h.uptrend ? 'BULLISH' : 'BEARISH' as const;
+    const price = c15m[c15m.length - 1].close;
+    const { regime, adx } = detectRegime(c1h);
 
-    // Detect market regime from 1h candles
-    const regime = detectRegime(c1h);
+    // 4h trend
+    const ema4hFast = EMA.calculate({ period: 20, values: c4h.map(c => c.close) });
+    const ema4hSlow = EMA.calculate({ period: 50, values: c4h.map(c => c.close) });
+    const tf4hUp    = ema4hFast.length && ema4hSlow.length
+      ? ema4hFast[ema4hFast.length - 1] > ema4hSlow[ema4hSlow.length - 1]
+      : false;
+    const trend4h   = tf4hUp ? 'BULLISH' : 'BEARISH' as const;
+
+    const trend1hResult = trendSignal(c1h, config.ta.rsiBuyMin, config.ta.rsiBuyMax, config.ta.rsiShortMin, config.ta.rsiShortMax);
+    const trend1h = trend1hResult.uptrend ? 'BULLISH' : 'BEARISH' as const;
 
     let signal: Signal = 'HOLD';
     let reason = '';
     let confidence = 0;
+    let rsi15m = 50;
 
-    if (regime === 'SIDEWAYS') {
-      // ── Bollinger Bands strategy ────────────────────────────────────────
-      const bb = analyzeBB(c15m, tf15m.rsi);
-      signal = bb.signal;
-      reason = `[SIDEWAYS] ${bb.reason}`;
+    if (regime === 'TRENDING') {
+      const trend15m = trendSignal(c15m, config.ta.rsiBuyMin, config.ta.rsiBuyMax, config.ta.rsiShortMin, config.ta.rsiShortMax);
+      rsi15m = trend15m.rsi;
 
-      // Confidence for BB: based on how close to band + RSI confirmation
-      if (signal !== 'HOLD') {
-        confidence = 50; // base
-        if (tf15m.rsi >= 30 && tf15m.rsi <= 70) confidence += 20;
-        if (bb.bandwidth < 4) confidence += 15; // tight band = stronger mean reversion
-        if (tf15m.volumeOk) confidence += 15;
-        confidence = Math.min(100, confidence);
+      const allBullish = tf4hUp && trend1hResult.uptrend && trend15m.uptrend;
+      const allBearish = !tf4hUp && !trend1hResult.uptrend && !trend15m.uptrend;
+
+      if (allBullish && trend15m.rsi >= config.ta.rsiBuyMin && trend15m.rsi <= config.ta.rsiBuyMax) {
+        signal = 'LONG';
+        reason = `[TRENDING] ${trend15m.reason}`;
+      } else if (allBearish && trend15m.rsi >= config.ta.rsiShortMin && trend15m.rsi <= config.ta.rsiShortMax) {
+        signal = 'SHORT';
+        reason = `[TRENDING] ${trend15m.reason}`;
+      } else if (trend15m.rsi >= config.ta.rsiSellMin) {
+        signal = 'SHORT';
+        reason = `[TRENDING] RSI overbought ${trend15m.rsi.toFixed(1)}`;
+      } else if (trend15m.rsi <= 30 && tf4hUp) {
+        signal = 'LONG';
+        reason = `[TRENDING] RSI oversold ${trend15m.rsi.toFixed(1)}`;
       }
 
-      logger.info(`${asset} [SIDEWAYS] BB signal: ${signal} | bandwidth: ${analyzeBB(c15m, tf15m.rsi).bandwidth.toFixed(1)}%`);
+      confidence = calcConfidence(trend15m, tf4hUp, regime, adx, signal !== 'HOLD' ? signal : (allBullish ? 'LONG' : 'SHORT'));
 
     } else {
-      // ── EMA + RSI strategy (trending) ──────────────────────────────────
-      const allBullish = tf4h.uptrend && tf1h.uptrend;
-      const allBearish = !tf4h.uptrend && !tf1h.uptrend;
-      const longEntry  = tf15m.uptrend && tf15m.rsi>=config.ta.rsiBuyMin && tf15m.rsi<=config.ta.rsiBuyMax;
-      const shortEntry = !tf15m.uptrend && tf15m.rsi>=config.ta.rsiShortMin && tf15m.rsi<=config.ta.rsiShortMax;
+      // SIDEWAYS — BB with STRICT 4h filter
+      const rsiArr = RSI.calculate({ period: 14, values: c15m.map(c => c.close) });
+      rsi15m = rsiArr.length ? rsiArr[rsiArr.length - 1] : 50;
 
-      if      (allBullish && longEntry)            signal = 'LONG';
-      else if (allBearish && shortEntry)           signal = 'SHORT';
-      else if (tf15m.rsi >= config.ta.rsiSellMin) signal = 'SHORT';
-      else if (tf15m.rsi <= 30 && tf4h.uptrend)   signal = 'LONG';
+      const bb = bbSignal(c15m, c1h, c4h, rsi15m);
+      signal = bb.signal;
+      reason = `[SIDEWAYS] ${bb.reason} | BW:${bb.bandwidth.toFixed(1)}%`;
 
-      if (signal !== 'HOLD') {
-        confidence = calcConfidence(tf15m, tf1h, tf4h, signal, regime);
-        reason = `[TRENDING] ${trend4h}/${trend1h} | RSI ${tf15m.rsi.toFixed(1)} | ${confidence}% conf`;
-      }
+      confidence = 30;
+      if (rsi15m >= 35 && rsi15m <= 65) confidence += 15;
+      if (adx < 20) confidence += 10;
+      if (signal !== 'HOLD') confidence += 15;
+      confidence = Math.min(100, confidence);
     }
 
+    logger.info(`${asset} → ${signal} | ${regime} | ADX:${adx.toFixed(1)} | conf:${confidence}% | RSI:${rsi15m.toFixed(1)} | 4h:${trend4h} | 1h:${trend1h}`);
+
     if (signal === 'HOLD') {
-      logger.info(`${asset} → HOLD | ${regime} | RSI:${tf15m.rsi.toFixed(1)} | ${trend4h}/${trend1h}`);
       return {
-        asset, signal:'HOLD', reason:`No signal (${regime})`, confidence:0,
-        currentPrice:price, rsi15m:tf15m.rsi, trend4h, trend1h, regime,
-        suggestedSL:0, suggestedTP:0, slPct:0, tpPct:0, rrRatio:0,
+        asset, signal: 'HOLD', reason: reason || `No signal (${regime})`,
+        confidence, currentPrice: price, rsi15m, trend4h, trend1h,
+        regime, adx,
+        suggestedSL: 0, suggestedTP: 0, slPct: 0, tpPct: 0, rrRatio: 0,
       };
     }
 
-    // ATR-based SL/TP
     const { sl, tp } = calcATRSlTp(c15m, price, signal);
-    const slDist = signal==='LONG' ? price-sl : sl-price;
-    const tpDist = signal==='LONG' ? tp-price : price-tp;
+    const slDist = signal === 'LONG' ? price - sl : sl - price;
+    const tpDist = signal === 'LONG' ? tp - price : price - tp;
     const rr     = tpDist / slDist;
-    const slPct  = (slDist/price)*100;
-    const tpPct  = (tpDist/price)*100;
-
-    logger.info(`${asset} → ${signal} | ${regime} | conf:${confidence}% | RSI:${tf15m.rsi.toFixed(1)} | R:R:${rr.toFixed(2)}`);
+    const slPct  = (slDist / price) * 100;
+    const tpPct  = (tpDist / price) * 100;
 
     return {
-      asset, signal, reason, confidence, currentPrice:price,
-      rsi15m:tf15m.rsi, trend4h, trend1h, regime,
-      suggestedSL:sl, suggestedTP:tp, slPct, tpPct, rrRatio:rr,
+      asset, signal, reason, confidence, currentPrice: price,
+      rsi15m, trend4h, trend1h, regime, adx,
+      suggestedSL: sl, suggestedTP: tp, slPct, tpPct, rrRatio: rr,
     };
 
   } catch (err: any) {
