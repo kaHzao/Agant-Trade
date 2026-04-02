@@ -92,9 +92,9 @@ function calcATRSlTp(candles: Candle[], price: number, signal: Signal) {
   const atr = atrArr.length ? atrArr[atrArr.length - 1] : price * 0.02;
 
   if (signal === 'LONG') {
-    return { sl: price - atr * 1.5, tp: price + atr * 1.5 * config.ta.minRR };
+    return { sl: price - atr * 1.0, tp: price + atr * 1.0 * config.ta.minRR };
   } else {
-    return { sl: price + atr * 1.5, tp: price - atr * 1.5 * config.ta.minRR };
+    return { sl: price + atr * 1.0, tp: price - atr * 1.0 * config.ta.minRR };
   }
 }
 
@@ -264,7 +264,7 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
     const tpPct  = (tpDist / price) * 100;
 
     // ── Minimum R:R gate ────────────────────────────────────────────────────
-    if (rr < config.ta.minRR) {
+    if (rr < config.ta.minRR - 0.01) {
       logger.info(`${asset}: R:R too low (${rr.toFixed(2)} < ${config.ta.minRR}) → HOLD`);
       return {
         asset, signal: 'HOLD',
