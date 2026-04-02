@@ -3,7 +3,8 @@ import { logger } from './utils/logger';
 import { sendAlert } from './utils/telegram';
 import { analyzeAll } from './ta/index';
 import { executeTrade, checkJupInstalled, getPositions, getMarketPrices } from './execution/jup';
-import { canTrade, recordTradeOpened, recordSL, getDailyStatus } from './utils/riskGuard';
+import { canTrade, recordTradeOpened, getDailyStatus } from './utils/riskGuard';
+import { detectClosedPositions, updateTrackedPositions } from './utils/positionTracker';
 
 async function main() {
   logger.info('═══ Jupiter Perps Agent starting ═══');
@@ -21,18 +22,24 @@ async function main() {
   // ── Log daily risk status ──────────────────────────────────────────────────
   logger.info(getDailyStatus());
 
-  // ── Check open positions (detect SL hits from previous cycle) ─────────────
+  // ── Check open positions ───────────────────────────────────────────────────
   const openPositions = getPositions();
   const openAssets = new Set(openPositions.map((p: any) => p.asset as string));
   logger.info(`Open positions: ${openPositions.length}`);
 
-  // ── Market prices ──────────────────────────────────────────────────────────
+  // ── Market prices (fetch before position tracker) ────────────────────────
   const prices = getMarketPrices();
   if (Object.keys(prices).length) {
     logger.info('Market prices', prices);
   }
 
-  // ── Run TA on all assets ───────────────────────────────────────────────────
+  // ── Detect SL/TP closes (compare with last known positions) ───────────────
+  await detectClosedPositions(openPositions, prices);
+
+  // ── Update tracker with current open positions ────────────────────────────
+  updateTrackedPositions(openPositions);
+
+  // ── Run TA ────────────────────────────────────────────────────────────────
   const signals = await analyzeAll();
 
   let tradesOpened = 0;
@@ -40,7 +47,6 @@ async function main() {
   for (const ta of signals) {
     if (!ta) continue;
 
-    // Skip if already in position
     if (openAssets.has(ta.asset)) {
       logger.info(`${ta.asset}: already in position, skipping`);
       continue;
@@ -56,15 +62,15 @@ async function main() {
       continue;
     }
 
-    // ── Risk Guard check ────────────────────────────────────────────────────
-    const guard = canTrade(ta.asset);
+    // ── Risk Guard ────────────────────────────────────────────────────────
+    const guard = canTrade(ta.asset, ta.signal as 'LONG' | 'SHORT');
     if (!guard.allowed) {
-      logger.warn(`${ta.asset}: BLOCKED by risk guard — ${guard.reason}`);
+      logger.warn(`${ta.asset}: BLOCKED — ${guard.reason}`);
       await sendAlert(`⛔ *${ta.asset} blocked*\n${guard.reason}`);
       continue;
     }
 
-    // ── Execute trade ────────────────────────────────────────────────────────
+    // ── Execute ───────────────────────────────────────────────────────────
     logger.info(`🎯 ${ta.signal} ${ta.asset} | ${ta.reason}`);
     const result = await executeTrade(ta);
 
@@ -80,7 +86,7 @@ async function main() {
         `SL: \`$${result.slPrice.toLocaleString()}\` (-${ta.slPct.toFixed(1)}%)\n` +
         `TP: \`$${result.tpPrice.toLocaleString()}\` (+${ta.tpPct.toFixed(1)}%)\n` +
         `R:R: \`${result.rrRatio.toFixed(1)}x\`\n` +
-        `Regime: ${ta.regime} | ADX: ${ta.adx.toFixed(0)} | Conf: ${ta.confidence}%\n` +
+        `Regime: ${ta.regime} | ADX:${ta.adx.toFixed(0)} | Conf:${ta.confidence}%\n` +
         `Signal: ${ta.reason}`
       );
     } else {
