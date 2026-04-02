@@ -34,7 +34,7 @@ async function main() {
   }
 
   // ── Detect SL/TP closes (compare with last known positions) ───────────────
-  await detectClosedPositions(openPositions);
+  await detectClosedPositions(openPositions, prices);
 
   // ── Update tracker with current open positions ────────────────────────────
   updateTrackedPositions(openPositions);
