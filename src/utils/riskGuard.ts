@@ -62,7 +62,7 @@ export interface GuardCheck {
 }
 
 // Check if we can open a new position for this asset
-export function canTrade(asset: Asset): GuardCheck {
+export function canTrade(asset: Asset, signal: 'LONG' | 'SHORT'): GuardCheck {
   const state = readGuard();
   const g = getAsset(state, asset);
   const now = Date.now();
