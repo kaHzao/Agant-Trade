@@ -1,0 +1,40 @@
+name: Daily Reflection
+
+on:
+  schedule:
+    - cron: '0 13 * * *'   # 20:00 WIB (UTC+7)
+  workflow_dispatch:         # bisa trigger manual dari GitHub
+
+jobs:
+  reflect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Download risk-guard state
+        uses: actions/cache@v4
+        with:
+          path: |
+            risk-guard.json
+            positions-tracker.json
+          key: agent-state-${{ github.run_id }}
+          restore-keys: |
+            agent-state-
+
+      - name: Run daily reflection
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: npm run reflect
