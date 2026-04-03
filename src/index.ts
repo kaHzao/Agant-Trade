@@ -53,7 +53,7 @@ async function main() {
     }
 
     if (ta.signal === 'HOLD') {
-      logger.info(`${ta.asset}: HOLD | ${ta.regime} | conf:${ta.confidence}% | RSI:${ta.rsi15m.toFixed(1)}`);
+      logger.info(`${ta.asset}: HOLD | ${ta.regime} | conf:${ta.confidence}% | RSI:${ta.rsi.toFixed(1)}`);
       continue;
     }
 
