@@ -4,18 +4,19 @@ import { logger } from './logger';
 import { sendAlert } from './telegram';
 import { recordSL, recordTP } from './riskGuard';
 import { config } from './config';
+import { logTrade } from './tradeLog';
 import type { Asset } from './config';
 
 const TRACKER_FILE = path.join(process.cwd(), 'positions-tracker.json');
 
 interface TrackedPosition {
-  asset:          string;
-  side:           'long' | 'short';
-  entryPrice:     number;
-  size:           number;
-  tpPrice?:       number;
-  slPrice?:       number;
-  openedAt:       number;
+  asset:           string;
+  side:            'long' | 'short';
+  entryPrice:      number;
+  size:            number;
+  tpPrice?:        number;
+  slPrice?:        number;
+  openedAt:        number;
   positionPubkey?: string;
 }
 
@@ -33,15 +34,11 @@ function writeTracker(state: TrackerState) {
   fs.writeFileSync(TRACKER_FILE, JSON.stringify(state, null, 2));
 }
 
-// ─── Detect close reason ──────────────────────────────────────────────────────
-// FIX: sign PnL SHORT diperbaiki
-
 function detectCloseReason(
   pos: TrackedPosition,
-  lastKnownPrice: number
+  lastPrice: number
 ): { closeReason: 'TP' | 'SL' | 'UNKNOWN'; pnlUsd: number | null } {
-
-  if (!pos.slPrice || !pos.tpPrice || lastKnownPrice <= 0) {
+  if (!pos.slPrice || !pos.tpPrice || lastPrice <= 0) {
     return { closeReason: 'UNKNOWN', pnlUsd: null };
   }
 
@@ -50,24 +47,21 @@ function detectCloseReason(
   const tp = pos.tpPrice;
 
   if (pos.side === 'long') {
-    // LONG: profit jika harga naik ke TP, loss jika turun ke SL
-    if (lastKnownPrice >= tp) {
+    if (lastPrice >= tp) {
       const pnlPct = ((tp - pos.entryPrice) / pos.entryPrice) * 100 * leverage;
       return { closeReason: 'TP', pnlUsd: (collateralUsdc * pnlPct) / 100 };
     }
-    if (lastKnownPrice <= sl) {
-      const pnlPct = ((sl - pos.entryPrice) / pos.entryPrice) * 100 * leverage; // negatif
+    if (lastPrice <= sl) {
+      const pnlPct = ((sl - pos.entryPrice) / pos.entryPrice) * 100 * leverage;
       return { closeReason: 'SL', pnlUsd: (collateralUsdc * pnlPct) / 100 };
     }
   } else {
-    // SHORT: profit jika harga turun ke TP, loss jika naik ke SL
-    // FIX: sign SHORT SL/TP diperbaiki
-    if (lastKnownPrice <= tp) {
-      const pnlPct = ((pos.entryPrice - tp) / pos.entryPrice) * 100 * leverage; // positif
+    if (lastPrice <= tp) {
+      const pnlPct = ((pos.entryPrice - tp) / pos.entryPrice) * 100 * leverage;
       return { closeReason: 'TP', pnlUsd: (collateralUsdc * pnlPct) / 100 };
     }
-    if (lastKnownPrice >= sl) {
-      const pnlPct = ((pos.entryPrice - sl) / pos.entryPrice) * 100 * leverage; // negatif
+    if (lastPrice >= sl) {
+      const pnlPct = ((pos.entryPrice - sl) / pos.entryPrice) * 100 * leverage;
       return { closeReason: 'SL', pnlUsd: (collateralUsdc * pnlPct) / 100 };
     }
   }
@@ -75,13 +69,11 @@ function detectCloseReason(
   return { closeReason: 'UNKNOWN', pnlUsd: null };
 }
 
-// ─── Detect closed positions ──────────────────────────────────────────────────
-
 export async function detectClosedPositions(
   currentPositions: any[],
-  marketPrices: Record<string, number>
+  marketPrices: Record<string, number> = {}
 ): Promise<void> {
-  const state = readTracker();
+  const state    = readTracker();
   const prevKeys = Object.keys(state.positions);
   if (prevKeys.length === 0) return;
 
@@ -98,9 +90,11 @@ export async function detectClosedPositions(
     const lastPrice = marketPrices[pos.asset] ?? 0;
     const { closeReason, pnlUsd } = detectCloseReason(pos, lastPrice);
 
-    const duration    = Math.round((Date.now() - pos.openedAt) / 60_000);
-    const pnlStr      = pnlUsd !== null ? `${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(3)}` : 'N/A';
-    const pnlEmoji    = pnlUsd === null ? '❓' : pnlUsd >= 0 ? '✅' : '❌';
+    const now         = new Date();
+    const duration    = Math.round((now.getTime() - pos.openedAt) / 60_000);
+    const pnlFinal    = pnlUsd ?? -(config.trading.collateralUsdc * 0.015);
+    const pnlStr      = `${pnlFinal >= 0 ? '+' : ''}$${pnlFinal.toFixed(3)}`;
+    const pnlEmoji    = pnlFinal >= 0 ? '✅' : '❌';
     const sideEmoji   = pos.side === 'long' ? '🟢' : '🔴';
     const reasonEmoji = closeReason === 'TP' ? '🎯' : closeReason === 'SL' ? '🛑' : '📋';
 
@@ -109,20 +103,36 @@ export async function detectClosedPositions(
       `${reasonEmoji} Reason: \`${closeReason}\`\n` +
       `Entry: \`$${pos.entryPrice.toLocaleString()}\`\n` +
       `Exit ~: \`$${lastPrice.toLocaleString()}\`\n` +
-      `TP: \`$${pos.tpPrice?.toLocaleString() ?? 'N/A'}\`  SL: \`$${pos.slPrice?.toLocaleString() ?? 'N/A'}\`\n` +
+      `TP: \`$${pos.tpPrice?.toLocaleString() ?? '—'}\`  SL: \`$${pos.slPrice?.toLocaleString() ?? '—'}\`\n` +
       `PnL: \`${pnlStr}\` ${pnlEmoji}\n` +
       `Duration: \`${duration} min\``
     );
 
-    const signal = pos.side === 'long' ? 'LONG' : 'SHORT';
+    // ── Log ke trade-log.json ─────────────────────────────────────────────
+    logTrade({
+      id:          `${pos.openedAt}-${pos.asset}-${pos.side}`,
+      agent:       'claude',
+      asset:       pos.asset,
+      side:        pos.side,
+      entryPrice:  pos.entryPrice,
+      exitPrice:   lastPrice,
+      entryTime:   new Date(pos.openedAt).toISOString(),
+      exitTime:    now.toISOString(),
+      durationMin: duration,
+      slPrice:     pos.slPrice ?? null,
+      tpPrice:     pos.tpPrice ?? null,
+      closeReason,
+      pnlUsd:      pnlFinal,
+      collateral:  config.trading.collateralUsdc,
+      leverage:    config.trading.leverage,
+    });
 
+    const signal = pos.side === 'long' ? 'LONG' : 'SHORT';
     if (closeReason === 'SL') {
-      const loss = pnlUsd !== null ? Math.abs(pnlUsd) : config.trading.collateralUsdc * 0.015;
-      await recordSL(pos.asset as Asset, signal, loss);
+      await recordSL(pos.asset as Asset, signal, Math.abs(pnlFinal));
     } else if (closeReason === 'TP') {
       recordTP(pos.asset as Asset, signal);
     } else {
-      // UNKNOWN: assume SL untuk safety
       logger.warn(`${pos.asset} close UNKNOWN — assuming SL`);
       await recordSL(pos.asset as Asset, signal, config.trading.collateralUsdc * 0.015);
     }
@@ -133,14 +143,12 @@ export async function detectClosedPositions(
   writeTracker(state);
 }
 
-// ─── Update tracker ───────────────────────────────────────────────────────────
-
 export function updateTrackedPositions(currentPositions: any[]): void {
   const state = readTracker();
 
   for (const pos of currentPositions) {
     const key = pos.positionPubkey || pos.asset;
-    if (state.positions[key]) continue; // sudah ditrack
+    if (state.positions[key]) continue;
 
     const tpPrice = pos.tpsl?.find((t: any) => t.type === 'tp')?.triggerPriceUsd;
     const slPrice = pos.tpsl?.find((t: any) => t.type === 'sl')?.triggerPriceUsd;
