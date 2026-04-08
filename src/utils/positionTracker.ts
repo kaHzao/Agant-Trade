@@ -255,4 +255,4 @@ export function updateTrackedPositions(currentPositions: any[]): void {
   }
 
   writeTracker(state);
-}a
+}
