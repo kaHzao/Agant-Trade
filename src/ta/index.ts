@@ -44,8 +44,7 @@ async function fetchOHLCV(asset: Asset, tf: '30m' | '1h' | '4h', limit = 100): P
   if (!symbol) throw new Error(`Unknown asset: ${asset}`);
 
   // Binance pakai interval string langsung: 30m, 1h, 4h
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=${limit + 1}`;
-
+  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf}&limit=${limit + 1}`;
   const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
   if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
 
