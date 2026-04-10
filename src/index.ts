@@ -63,7 +63,7 @@ async function main() {
     }
 
     // ── Risk Guard ────────────────────────────────────────────────────────
-    const guard = canTrade(ta.asset, ta.signal as 'LONG' | 'SHORT');
+    const guard = canTrade(ta.asset);
     if (!guard.allowed) {
       logger.warn(`${ta.asset}: BLOCKED — ${guard.reason}`);
       await sendAlert(`⛔ *${ta.asset} blocked*\n${guard.reason}`);
