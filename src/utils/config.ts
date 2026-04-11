@@ -17,31 +17,27 @@ export const config = {
   },
 
   ta: {
-    // ── EMA ──────────────────────────────────────────────────────────────────
+    // EMA trend
     emaFast: 20,
     emaSlow: 50,
 
-    // ── RSI ──────────────────────────────────────────────────────────────────
-    rsiPeriod:   14,
-    rsiBuyMin:   40,   // LONG floor
-    rsiBuyMax:   65,   // LONG ceiling (diperlebar)
-    rsiShortMin: 35,   // SHORT floor
-    rsiShortMax: 60,   // SHORT ceiling
+    // RSI
+    rsiPeriod: 14,
 
-    // ── ATR ──────────────────────────────────────────────────────────────────
+    // ATR — sekarang dari 1h, multiplier 2.5
     atrPeriod:       14,
-    atrMultiplier:   1.5,  // SL = ATR(1h) x 1.5
-    atrTpMultiplier: 3.0,  // TP = ATR(1h) x 3.0 → RR ~2.0
+    atrMultiplier:   2.5,
 
-    // ── Regime ───────────────────────────────────────────────────────────────
-    adxTrending: 25,
-    adxStrong:   30,
-
-    // ── Filter ───────────────────────────────────────────────────────────────
-    minConfidence:    75,   // naik dari 60
+    // Volume spike filter
     volumeMultiplier: 1.2,
 
-    // ── R:R gate (independen dari ATR multiplier) ─────────────────────────
-    minRR: 1.75,
+    // ADX — harus > 28 untuk entry
+    adxMin: 28,
+
+    // Min confidence
+    minConfidence: 65,
+
+    // Min RR — naik ke 2.5
+    minRR: 2.5,
   },
 };
