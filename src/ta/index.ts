@@ -28,38 +28,44 @@ interface Candle {
   close: number; volume: number;
 }
 
-// ─── Binance symbol map ───────────────────────────────────────────────────────
+// ─── OKX symbol map ───────────────────────────────────────────────────────────
 
-const BINANCE_SYMBOL: Record<string, string> = {
-  SOL:  'SOLUSDT',
-  BTC:  'BTCUSDT',
-  WBTC: 'BTCUSDT',
-  ETH:  'ETHUSDT',
+const OKX_SYMBOL: Record<string, string> = {
+  SOL:  'SOL-USDT',
+  BTC:  'BTC-USDT',
+  WBTC: 'BTC-USDT',
+  ETH:  'ETH-USDT',
 };
 
-// ─── Fetch OHLCV dari Binance (ganti CryptoCompare) ──────────────────────────
+// ─── Fetch OHLCV dari OKX ─────────────────────────────────────────────────────
 
 async function fetchOHLCV(asset: Asset, tf: '30m' | '1h' | '4h', limit = 100): Promise<Candle[]> {
-  const symbol = BINANCE_SYMBOL[asset];
-  if (!symbol) throw new Error(`Unknown asset: ${asset}`);
+  const instId = OKX_SYMBOL[asset];
+  if (!instId) throw new Error(`Unknown asset: ${asset}`);
 
-  // Binance pakai interval string langsung: 30m, 1h, 4h
-  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf}&limit=${limit + 1}`;
+  const bar = tf === '30m' ? '30m' : tf === '1h' ? '1H' : '4H';
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${limit + 1}`;
+
   const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
+  if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
 
-  const raw: any[][] = await res.json();
+  const json = await res.json();
+  if (json.code !== '0') throw new Error(`OKX error: ${json.msg}`);
 
-  // Buang candle terakhir — masih live/belum close
-  const closed = raw.slice(0, -1);
+  // OKX format: [ts, open, high, low, close, vol, ...]
+  // Data diurutkan dari terbaru ke terlama — reverse dulu
+  const candles = (json.data as string[][])
+    .reverse()
+    .slice(0, -1) // buang candle terbaru (belum close)
+    .map(k => ({
+      open:   parseFloat(k[1]),
+      high:   parseFloat(k[2]),
+      low:    parseFloat(k[3]),
+      close:  parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }));
 
-  return closed.map((k) => ({
-    open:   parseFloat(k[1]),
-    high:   parseFloat(k[2]),
-    low:    parseFloat(k[3]),
-    close:  parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
+  return candles;
 }
 
 // ─── EMA Trend Direction ──────────────────────────────────────────────────────
@@ -158,7 +164,6 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
   try {
     logger.info(`Analyzing ${asset}...`);
 
-    // Fetch 3 timeframes — delay 500ms antar request (Binance lebih cepat dari CC)
     const c30m = await fetchOHLCV(asset, '30m', 100);
     await new Promise(r => setTimeout(r, 500));
     const c1h  = await fetchOHLCV(asset, '1h',  100);
@@ -172,7 +177,6 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
 
     const price = c30m[c30m.length - 1].close;
 
-    // Trend direction per TF
     const tf4hUp  = emaUptrend(c4h);
     const tf1hUp  = emaUptrend(c1h);
     const tf30mUp = emaUptrend(c30m);
@@ -185,8 +189,6 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
     const rsi    = getRSI(c30m);
     const volOk  = volumeOk(c30m);
 
-    // CORE LOGIC — STRICT ALIGNMENT RULE
-    // 4h + 1h MUST agree → konflik = HOLD PAKSA
     let signal: Signal = 'HOLD';
     let reason = '';
 
