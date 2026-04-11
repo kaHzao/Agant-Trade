@@ -52,11 +52,10 @@ async function fetchOHLCV(asset: Asset, tf: '30m' | '1h' | '4h', limit = 100): P
   const json = await res.json();
   if (json.code !== '0') throw new Error(`OKX error: ${json.msg}`);
 
-  // OKX format: [ts, open, high, low, close, vol, ...]
-  // Data diurutkan dari terbaru ke terlama — reverse dulu
+  // OKX: terbaru → terlama, reverse + buang candle live terakhir
   const candles = (json.data as string[][])
     .reverse()
-    .slice(0, -1) // buang candle terbaru (belum close)
+    .slice(0, -1)
     .map(k => ({
       open:   parseFloat(k[1]),
       high:   parseFloat(k[2]),
@@ -85,7 +84,7 @@ function getRSI(candles: Candle[]): number {
   return rsiArr.length ? rsiArr[rsiArr.length - 1] : 50;
 }
 
-// ─── ADX ──────────────────────────────────────────────────────────────────────
+// ─── ADX dari 1h ──────────────────────────────────────────────────────────────
 
 function getADX(candles: Candle[]): number {
   const adxArr = ADX.calculate({
@@ -97,21 +96,26 @@ function getADX(candles: Candle[]): number {
   return adxArr.length ? (adxArr[adxArr.length - 1].adx || 10) : 10;
 }
 
-// ─── ATR SL/TP ────────────────────────────────────────────────────────────────
+// ─── ATR SL/TP — dari 1h (bukan 30m) ─────────────────────────────────────────
 
-function calcATRSlTp(candles: Candle[], price: number, signal: Signal) {
+function calcATRSlTp(candles1h: Candle[], price: number, signal: Signal) {
   const atrArr = ATR.calculate({
     period: 14,
-    high:  candles.map(c => c.high),
-    low:   candles.map(c => c.low),
-    close: candles.map(c => c.close),
+    high:  candles1h.map(c => c.high),
+    low:   candles1h.map(c => c.low),
+    close: candles1h.map(c => c.close),
   });
   const atr = atrArr.length ? atrArr[atrArr.length - 1] : price * 0.02;
 
+  // SL: ATR 1h x2.5 — lebih lebar, hindari whipsaw
+  // TP: SL x minRR (2.5) → RR 2.5
+  const slDist = atr * 2.5;
+  const tpDist = slDist * config.ta.minRR;
+
   if (signal === 'LONG') {
-    return { sl: price - atr * 1.5, tp: price + atr * 1.5 * config.ta.minRR };
+    return { sl: price - slDist, tp: price + tpDist, atr };
   } else {
-    return { sl: price + atr * 1.5, tp: price - atr * 1.5 * config.ta.minRR };
+    return { sl: price + slDist, tp: price - tpDist, atr };
   }
 }
 
@@ -139,19 +143,22 @@ function calcConfidence(
     if (tf4hUp)  score += 25;
     if (tf1hUp)  score += 25;
     if (tf30mUp) score += 15;
+    // RSI zone lebih sempit: 45-58 ideal, 40-62 acceptable
     if (rsi >= 45 && rsi <= 58) score += 20;
     else if (rsi >= 40 && rsi <= 62) score += 10;
-    if (adx > 25) score += 10;
-    else if (adx > 20) score += 5;
+    // ADX lebih ketat: >28 strong trend
+    if (adx > 28) score += 10;
+    else if (adx > 23) score += 5;
     if (volOk) score += 5;
   } else {
     if (!tf4hUp)  score += 25;
     if (!tf1hUp)  score += 25;
     if (!tf30mUp) score += 15;
+    // RSI zone SHORT: 42-55 ideal
     if (rsi >= 42 && rsi <= 55) score += 20;
     else if (rsi >= 38 && rsi <= 60) score += 10;
-    if (adx > 25) score += 10;
-    else if (adx > 20) score += 5;
+    if (adx > 28) score += 10;
+    else if (adx > 23) score += 5;
     if (volOk) score += 5;
   }
 
@@ -175,8 +182,9 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       return null;
     }
 
-    const price = c30m[c30m.length - 1].close;
+    const price = c1h[c1h.length - 1].close; // pakai 1h close sebagai price reference
 
+    // Trend per TF
     const tf4hUp  = emaUptrend(c4h);
     const tf1hUp  = emaUptrend(c1h);
     const tf30mUp = emaUptrend(c30m);
@@ -184,13 +192,28 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
     const trend4h = tf4hUp ? 'BULLISH' : 'BEARISH' as const;
     const trend1h = tf1hUp ? 'BULLISH' : 'BEARISH' as const;
 
+    // ADX dari 1h — lebih stable dari 30m
     const adx    = getADX(c1h);
-    const regime: MarketRegime = adx > 20 ? 'TRENDING' : 'SIDEWAYS';
-    const rsi    = getRSI(c30m);
-    const volOk  = volumeOk(c30m);
+    const regime: MarketRegime = adx > 23 ? 'TRENDING' : 'SIDEWAYS';
+
+    // RSI dari 30m — tetap untuk timing entry
+    const rsi   = getRSI(c30m);
+    const volOk = volumeOk(c30m);
 
     let signal: Signal = 'HOLD';
     let reason = '';
+
+    // ADX filter ketat di depan — block entry kalau market sideways
+    if (adx < 28) {
+      reason = `ADX terlalu lemah (${adx.toFixed(1)} < 28) → HOLD, tunggu trending`;
+      logger.info(`${asset} → HOLD | ADX:${adx.toFixed(1)} < 28`);
+      return {
+        asset, signal: 'HOLD', reason,
+        confidence: 0, currentPrice: price, rsi15m: rsi,
+        trend4h, trend1h, regime, adx,
+        suggestedSL: 0, suggestedTP: 0, slPct: 0, tpPct: 0, rrRatio: 0,
+      };
+    }
 
     const conflict = tf4hUp !== tf1hUp;
 
@@ -198,23 +221,25 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       reason = `KONFLIK: 4h ${trend4h} vs 1h ${trend1h} → HOLD PAKSA`;
 
     } else if (tf4hUp && tf1hUp) {
-      if (rsi >= 40 && rsi <= 60) {
+      // RSI zone LONG lebih sempit: 45-58
+      if (rsi >= 45 && rsi <= 58) {
         signal = 'LONG';
-        reason = `4h✓ 1h✓ 30m:${tf30mUp ? '✓' : '↕'} | RSI:${rsi.toFixed(1)}`;
-      } else if (rsi > 60) {
-        reason = `4h+1h BULLISH tapi RSI terlalu tinggi (${rsi.toFixed(1)}) → tunggu pullback`;
+        reason = `4h✓ 1h✓ 30m:${tf30mUp ? '✓' : '↕'} | RSI:${rsi.toFixed(1)} | ADX:${adx.toFixed(1)}`;
+      } else if (rsi > 58) {
+        reason = `4h+1h BULLISH tapi RSI overbought (${rsi.toFixed(1)}) → tunggu pullback`;
       } else {
-        reason = `4h+1h BULLISH tapi RSI terlalu rendah (${rsi.toFixed(1)})`;
+        reason = `4h+1h BULLISH tapi RSI terlalu rendah (${rsi.toFixed(1)} < 45)`;
       }
 
     } else if (!tf4hUp && !tf1hUp) {
-      if (rsi >= 40 && rsi <= 60) {
+      // RSI zone SHORT: 42-55
+      if (rsi >= 42 && rsi <= 55) {
         signal = 'SHORT';
-        reason = `4h✓ 1h✓ 30m:${!tf30mUp ? '✓' : '↕'} | RSI:${rsi.toFixed(1)}`;
-      } else if (rsi < 40) {
-        reason = `4h+1h BEARISH tapi RSI terlalu rendah (${rsi.toFixed(1)}) → tunggu bounce`;
+        reason = `4h✓ 1h✓ 30m:${!tf30mUp ? '✓' : '↕'} | RSI:${rsi.toFixed(1)} | ADX:${adx.toFixed(1)}`;
+      } else if (rsi < 42) {
+        reason = `4h+1h BEARISH tapi RSI oversold (${rsi.toFixed(1)}) → tunggu bounce`;
       } else {
-        reason = `4h+1h BEARISH tapi RSI terlalu tinggi (${rsi.toFixed(1)})`;
+        reason = `4h+1h BEARISH tapi RSI terlalu tinggi (${rsi.toFixed(1)} > 55)`;
       }
     }
 
@@ -241,12 +266,15 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       };
     }
 
-    const { sl, tp } = calcATRSlTp(c30m, price, signal);
+    // SL/TP dari ATR 1h
+    const { sl, tp, atr } = calcATRSlTp(c1h, price, signal);
     const slDist = signal === 'LONG' ? price - sl : sl - price;
     const tpDist = signal === 'LONG' ? tp - price : price - tp;
     const rr     = tpDist / slDist;
     const slPct  = (slDist / price) * 100;
     const tpPct  = (tpDist / price) * 100;
+
+    logger.info(`${asset} ATR(1h):${atr.toFixed(3)} SL:${sl.toFixed(2)} TP:${tp.toFixed(2)} RR:${rr.toFixed(2)}`);
 
     if (rr < config.ta.minRR) {
       logger.info(`${asset}: R:R too low (${rr.toFixed(2)} < ${config.ta.minRR}) → HOLD`);
