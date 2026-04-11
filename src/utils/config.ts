@@ -42,6 +42,6 @@ export const config = {
     volumeMultiplier: 1.2,
 
     // ── R:R gate (independen dari ATR multiplier) ─────────────────────────
-    minRR: 1.8,
+    minRR: 1.75,
   },
 };
