@@ -484,7 +484,7 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       `SL:${sl.toFixed(2)} TP:${tp.toFixed(2)} RR:${rr.toFixed(2)}`
     );
 
-    if (rr < config.ta.minRR) {
+    if (rr < config.ta.minRR - 0.001) { // -0.001 tolerance untuk floating point precision
       logger.info(`${asset}: R:R too low (${rr.toFixed(2)} < ${config.ta.minRR}) → HOLD`);
       return {
         asset, signal: 'HOLD',
