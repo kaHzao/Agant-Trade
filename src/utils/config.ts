@@ -48,7 +48,7 @@ export const config = {
     emaSlopeLookback: 5,
 
     // Min confidence
-    minConfidence: 65,
+    minConfidence: 70,
 
     // Min RR
     minRR: 2.5,
