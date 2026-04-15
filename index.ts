@@ -60,12 +60,12 @@ async function main() {
     }
 
     if (ta.signal === 'HOLD') {
-      logger.info(`${ta.asset}: HOLD | ${ta.regime} | ADX:${ta.adx.toFixed(0)} | conf:${ta.confidence}% | RSI:${ta.rsi.toFixed(1)} | ${ta.reason}`);
+      logger.info(`${ta.asset}: HOLD | ${ta.regime} | ADX:${ta.adx.toFixed(0)}${ta.adxRising ? '↑' : '↓'} | conf:${ta.confidence}% | RSI:${ta.rsi.toFixed(1)} | ${ta.reason}`);
       continue;
     }
 
     // ── Risk guard ─────────────────────────────────────────────────────────
-    const guard = canTrade(ta.asset, ta.signal as 'LONG' | 'SHORT');
+    const guard = canTrade(ta.asset);
     if (!guard.allowed) {
       logger.warn(`${ta.asset}: BLOCKED — ${guard.reason}`);
       await sendAlert(`⛔ *${ta.asset} blocked*\n${guard.reason}`);
@@ -81,7 +81,9 @@ async function main() {
       openAssets.add(ta.asset); // prevent double-entry dalam 1 cycle
       recordTradeOpened(ta.asset);
 
-      const emoji = ta.signal === 'LONG' ? '🟢' : '🔴';
+      const macdEmoji = ta.macdHistogram > 0 ? '🟢' : '🔴';
+      const bbPct     = (ta.bbPosition * 100).toFixed(0);
+      const emoji     = ta.signal === 'LONG' ? '🟢' : '🔴';
       await sendAlert(
         `${emoji} *${ta.signal} ${ta.asset}*${result.dryRun ? ' _(DRY RUN)_' : ''}\n` +
         `Price: \`$${ta.currentPrice.toLocaleString()}\`\n` +
@@ -89,7 +91,8 @@ async function main() {
         `SL: \`$${result.slPrice.toLocaleString()}\` (-${ta.slPct.toFixed(2)}%)\n` +
         `TP: \`$${result.tpPrice.toLocaleString()}\` (+${ta.tpPct.toFixed(2)}%)\n` +
         `R:R: \`${result.rrRatio.toFixed(2)}x\`\n` +
-        `Regime: ${ta.regime} | ADX:${ta.adx.toFixed(0)} | Conf:${ta.confidence}%\n` +
+        `Regime: ${ta.regime} | ADX:${ta.adx.toFixed(0)}${ta.adxRising ? '↑' : ''} | Conf:${ta.confidence}%\n` +
+        `MACD: ${macdEmoji}\`${ta.macdHistogram.toFixed(5)}\` | BB: \`${bbPct}%\`${ta.bbSqueeze ? ' 🔄' : ''} | Slope: \`${ta.emaSlope1h.toFixed(3)}%\`\n` +
         `Signal: ${ta.reason}`
       );
     } else {
