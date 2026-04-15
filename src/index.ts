@@ -39,15 +39,8 @@ async function main() {
   await detectClosedPositions(openPositions, prices);
   updateTrackedPositions(openPositions);
 
-  // ── Skip TA kalau semua pair sudah ada posisi ──────────────────────────────
-  const availableAssets = ASSETS.filter(a => !openAssets.has(a));
-  if (availableAssets.length === 0) {
-    logger.info('All pairs in position — skipping TA this cycle');
-    logger.info(`═══ Cycle complete (${Date.now() - startTime}ms) ═══\n`);
-    return;
-  }
-
-  // ── Run TA ─────────────────────────────────────────────────────────────────
+  // ── Run TA — selalu dijalankan meski semua pair in position ────────────────
+  // Alasan: perlu deteksi reversal signal pada posisi yang sedang open
   const signals = await analyzeAll();
   let tradesOpened = 0;
 
@@ -55,7 +48,38 @@ async function main() {
     if (!ta) continue;
 
     if (openAssets.has(ta.asset)) {
-      logger.info(`${ta.asset}: already in position, skipping`);
+      // ── Reversal detection: signal berlawanan dengan posisi open ────────────
+      if (ta.signal !== 'HOLD' && ta.confidence >= config.ta.minConfidence) {
+        const openPos = openPositions.find((p: any) => p.asset === ta.asset);
+        if (openPos) {
+          const posSide = (openPos.side as string).toLowerCase();     // 'long' / 'short'
+          const sigSide = ta.signal.toLowerCase();                    // 'long' / 'short'
+
+          if (posSide !== sigSide) {
+            const posEmoji = posSide === 'long' ? '🟢' : '🔴';
+            const sigEmoji = ta.signal === 'LONG' ? '🟢' : '🔴';
+            const entryPrice = openPos.entryPriceUsd ?? openPos.markPriceUsd ?? 0;
+
+            logger.warn(
+              `⚠️  REVERSAL ${ta.asset}: pos ${posSide.toUpperCase()} vs signal ${ta.signal} ` +
+              `conf:${ta.confidence}% MACD:${ta.macdHistogram.toFixed(4)}`
+            );
+
+            await sendAlert(
+              `⚠️ *REVERSAL SIGNAL: ${ta.asset}*\n` +
+              `${posEmoji} Posisi open: \`${posSide.toUpperCase()}\`` +
+              `${entryPrice > 0 ? ` @ \`$${entryPrice.toLocaleString()}\`` : ''}\n` +
+              `${sigEmoji} Signal baru: \`${ta.signal}\` conf:\`${ta.confidence}%\`\n` +
+              `RSI: \`${ta.rsi.toFixed(1)}\` | ADX: \`${ta.adx.toFixed(0)}${ta.adxRising ? '↑' : '↓'}\`\n` +
+              `MACD: ${ta.macdHistogram > 0 ? '🟢' : '🔴'}\`${ta.macdHistogram.toFixed(5)}\` | ` +
+              `BB: \`${(ta.bbPosition * 100).toFixed(0)}%\`${ta.bbSqueeze ? ' 🔄' : ''}\n` +
+              `_→ Pertimbangkan close manual_`
+            );
+          }
+        }
+      }
+
+      logger.info(`${ta.asset}: already in position, skipping entry`);
       continue;
     }
 
@@ -81,7 +105,7 @@ async function main() {
 
     if (result.success) {
       tradesOpened++;
-      openAssets.add(ta.asset); // prevent double-entry dalam 1 cycle
+      openAssets.add(ta.asset);
       recordTradeOpened(ta.asset);
 
       const macdEmoji = ta.macdHistogram > 0 ? '🟢' : '🔴';
